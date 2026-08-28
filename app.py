@@ -46,6 +46,13 @@ HISTORIAL_COLUMNS = [
     "ventas_total", "fecha_carga",
 ]
 
+REGIONES_CHILE = {
+    "1": "Tarapacá", "2": "Antofagasta", "3": "Atacama", "4": "Coquimbo",
+    "5": "Valparaíso", "6": "O'Higgins", "7": "Maule", "8": "Biobío",
+    "9": "Araucanía", "10": "Los Lagos", "11": "Aysén", "12": "Magallanes",
+    "13": "Metropolitana", "14": "Los Ríos", "15": "Arica y Parinacota", "16": "Ñuble",
+}
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -303,6 +310,93 @@ def procesar_semana(sh, df, semana):
 
 
 # ---------------------------------------------------------------------------
+# Indicadores adicionales: cierre, distribución geográfica, variación semanal
+# ---------------------------------------------------------------------------
+
+def nombre_region(codigo):
+    if pd.isna(codigo) or str(codigo).strip() == "":
+        return "Sin región"
+    codigo_str = str(codigo).strip()
+    if codigo_str.endswith(".0"):
+        codigo_str = codigo_str[:-2]
+    return REGIONES_CHILE.get(codigo_str, f"Región {codigo_str}")
+
+
+def calcular_metricas_cierre(master_df):
+    """Tasa de cierre (derivados que terminan comprando) y ticket promedio,
+    calculado sobre el total histórico de clientes (no por semana)."""
+    if master_df.empty:
+        return {"total_derivados": 0, "total_con_venta": 0, "suma_ventas": 0.0,
+                "tasa_cierre": 0.0, "ticket_promedio": 0.0}
+
+    es_derivado = master_df["estado"] == ESTADO_DERIVADO
+    tiene_venta = master_df["venta"].notna() & (master_df["venta"] > 0)
+
+    total_derivados = int(es_derivado.sum())
+    total_con_venta = int(tiene_venta.sum())
+    suma_ventas = float(master_df.loc[tiene_venta, "venta"].sum()) if total_con_venta else 0.0
+    tasa_cierre = (total_con_venta / total_derivados * 100) if total_derivados else 0.0
+    ticket_promedio = (suma_ventas / total_con_venta) if total_con_venta else 0.0
+
+    return {
+        "total_derivados": total_derivados,
+        "total_con_venta": total_con_venta,
+        "suma_ventas": suma_ventas,
+        "tasa_cierre": tasa_cierre,
+        "ticket_promedio": ticket_promedio,
+    }
+
+
+def calcular_distribucion_regional(master_df):
+    if master_df.empty:
+        return pd.DataFrame(columns=["Región", "Derivados", "Clientes con venta", "Ventas ($)"])
+    df = master_df.copy()
+    df["region_nombre"] = df["region"].apply(nombre_region)
+    df["es_derivado"] = df["estado"] == ESTADO_DERIVADO
+    df["tiene_venta"] = df["venta"].notna() & (df["venta"] > 0)
+    resumen = df.groupby("region_nombre").agg(
+        Derivados=("es_derivado", "sum"),
+        **{"Clientes con venta": ("tiene_venta", "sum")},
+        Ventas=("venta", "sum"),
+    ).reset_index().rename(columns={"region_nombre": "Región", "Ventas": "Ventas ($)"})
+    return resumen.sort_values("Ventas ($)", ascending=False).reset_index(drop=True)
+
+
+def calcular_top_localidades(master_df, top_n=10):
+    if master_df.empty or "localidad" not in master_df.columns:
+        return pd.DataFrame(columns=["Localidad", "Derivados", "Ventas ($)"])
+    df = master_df.copy()
+    df["es_derivado"] = df["estado"] == ESTADO_DERIVADO
+    df["localidad"] = df["localidad"].fillna("Sin localidad")
+    resumen = df.groupby("localidad").agg(
+        Derivados=("es_derivado", "sum"),
+        Ventas=("venta", "sum"),
+    ).reset_index().rename(columns={"localidad": "Localidad", "Ventas": "Ventas ($)"})
+    return resumen.sort_values(["Ventas ($)", "Derivados"], ascending=False).head(top_n).reset_index(drop=True)
+
+
+def agregar_variaciones(historial_df):
+    """Agrega columnas de variación % semana contra semana anterior."""
+    df = historial_df.sort_values("semana").reset_index(drop=True).copy()
+    for col_origen, col_nueva in [
+        ("whatsapp_enviados", "var_enviados"),
+        ("derivados", "var_derivados"),
+        ("ventas_total", "var_ventas"),
+    ]:
+        anterior = df[col_origen].shift(1)
+        variacion = ((df[col_origen] - anterior) / anterior.replace(0, pd.NA)) * 100
+        df[col_nueva] = variacion.replace([float("inf"), float("-inf")], pd.NA)
+    return df
+
+
+def formatear_variacion(valor):
+    if pd.isna(valor):
+        return "-"
+    flecha = "▲" if valor > 0 else ("▼" if valor < 0 else "▬")
+    return f"{flecha} {valor:+.1f}%"
+
+
+# ---------------------------------------------------------------------------
 # Generación de informe Word
 # ---------------------------------------------------------------------------
 
@@ -362,9 +456,12 @@ def generar_grafico_estatico(historial):
     return buf
 
 
-def generar_informe_docx(historial):
-    """Arma el informe Word completo: resumen, tabla y gráfico."""
+def generar_informe_docx(historial, master_df):
+    """Arma el informe Word completo: resumen, tabla, distribución geográfica y gráfico."""
     datos = calcular_comentario_automatico(historial)
+    cierre = calcular_metricas_cierre(master_df)
+    historial_var = agregar_variaciones(historial)
+    ultima = historial_var.iloc[-1]
 
     doc = Document()
     doc.add_heading("Informe de Avance — Campaña WhatsApp Clientes Potenciales", level=1)
@@ -380,6 +477,18 @@ def generar_informe_docx(historial):
         f"Las ventas acumuladas alcanzan ${datos['total_ventas']:,.0f}."
     )
     doc.add_paragraph(resumen)
+    doc.add_paragraph(
+        f"Del total histórico de {cierre['total_derivados']} clientes derivados a un vendedor, "
+        f"{cierre['total_con_venta']} compraron (tasa de cierre de {cierre['tasa_cierre']:.1f}%), "
+        f"con un ticket promedio de ${cierre['ticket_promedio']:,.0f} por venta."
+    )
+    if not pd.isna(ultima["var_enviados"]) or not pd.isna(ultima["var_derivados"]):
+        partes = []
+        if not pd.isna(ultima["var_enviados"]):
+            partes.append(f"los envíos de WhatsApp variaron {ultima['var_enviados']:+.1f}%")
+        if not pd.isna(ultima["var_derivados"]):
+            partes.append(f"los derivados variaron {ultima['var_derivados']:+.1f}%")
+        doc.add_paragraph(f"Respecto a la semana anterior, {' y '.join(partes)}.")
     if datos["semana_mas_derivados"] is not None:
         doc.add_paragraph(
             f"La semana {datos['semana_mas_derivados']} tuvo la mayor cantidad de clientes derivados."
@@ -401,6 +510,22 @@ def generar_informe_docx(historial):
         celdas[1].text = str(int(fila["whatsapp_enviados"]))
         celdas[2].text = str(int(fila["derivados"]))
         celdas[3].text = f"${fila['ventas_total']:,.0f}"
+
+    doc.add_heading("Distribución geográfica por región", level=2)
+    dist_regional = calcular_distribucion_regional(master_df)
+    if dist_regional.empty:
+        doc.add_paragraph("Sin datos de región disponibles todavía.")
+    else:
+        tabla_reg = doc.add_table(rows=1, cols=4)
+        tabla_reg.style = "Light Grid Accent 1"
+        for i, texto in enumerate(["Región", "Derivados", "Clientes con venta", "Ventas ($)"]):
+            tabla_reg.rows[0].cells[i].text = texto
+        for _, fila in dist_regional.iterrows():
+            celdas = tabla_reg.add_row().cells
+            celdas[0].text = str(fila["Región"])
+            celdas[1].text = str(int(fila["Derivados"]))
+            celdas[2].text = str(int(fila["Clientes con venta"]))
+            celdas[3].text = f"${fila['Ventas ($)']:,.0f}"
 
     doc.add_heading("WhatsApp enviados vs Ventas", level=2)
     imagen = generar_grafico_estatico(historial)
@@ -520,13 +645,31 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 historial = load_historial(sh)
+master_df = load_master(sh)
 
 st.subheader("Avance por semana")
 
 if historial.empty:
     st.info("Aún no hay datos cargados. Sube el primer Excel desde el panel lateral.")
 else:
-    tabla_mostrar = historial.rename(columns={
+    historial_var = agregar_variaciones(historial)
+    ultima = historial_var.iloc[-1]
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric(
+        "WhatsApp enviados (última semana)", int(ultima["whatsapp_enviados"]),
+        delta=None if pd.isna(ultima["var_enviados"]) else f"{ultima['var_enviados']:+.1f}% vs semana anterior",
+    )
+    col2.metric(
+        "Derivados (última semana)", int(ultima["derivados"]),
+        delta=None if pd.isna(ultima["var_derivados"]) else f"{ultima['var_derivados']:+.1f}% vs semana anterior",
+    )
+    col3.metric(
+        "Ventas (última semana)", f"${ultima['ventas_total']:,.0f}",
+        delta=None if pd.isna(ultima["var_ventas"]) else f"{ultima['var_ventas']:+.1f}% vs semana anterior",
+    )
+
+    tabla_mostrar = historial_var.rename(columns={
         "semana": "Semana",
         "whatsapp_enviados": "WhatsApp enviados",
         "sin_whatsapp": "Sin WhatsApp",
@@ -534,11 +677,32 @@ else:
         "ventas_total": "Ventas ($)",
         "fecha_carga": "Última carga",
     })
+    tabla_mostrar["Var. enviados"] = historial_var["var_enviados"].apply(formatear_variacion)
+    tabla_mostrar["Var. derivados"] = historial_var["var_derivados"].apply(formatear_variacion)
+    tabla_mostrar["Var. ventas"] = historial_var["var_ventas"].apply(formatear_variacion)
+
     st.dataframe(
-        tabla_mostrar[["Semana", "WhatsApp enviados", "Derivados", "Ventas ($)",
+        tabla_mostrar[["Semana", "WhatsApp enviados", "Var. enviados",
+                        "Derivados", "Var. derivados", "Ventas ($)", "Var. ventas",
                         "Sin WhatsApp", "Última carga"]],
         use_container_width=True, hide_index=True
     )
+
+    st.subheader("Indicadores de cierre")
+    metricas_cierre = calcular_metricas_cierre(master_df)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total derivados (histórico)", metricas_cierre["total_derivados"])
+    col2.metric("Tasa de cierre (derivados → venta)", f"{metricas_cierre['tasa_cierre']:.1f}%")
+    col3.metric("Ticket promedio", f"${metricas_cierre['ticket_promedio']:,.0f}")
+
+    st.subheader("Distribución geográfica")
+    col_izq, col_der = st.columns(2)
+    with col_izq:
+        st.caption("Por región")
+        st.dataframe(calcular_distribucion_regional(master_df), use_container_width=True, hide_index=True)
+    with col_der:
+        st.caption("Top 10 localidades")
+        st.dataframe(calcular_top_localidades(master_df), use_container_width=True, hide_index=True)
 
     st.subheader("WhatsApp enviados vs Ventas por semana")
 
@@ -562,7 +726,7 @@ else:
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Informe descargable")
-    informe_docx = generar_informe_docx(historial)
+    informe_docx = generar_informe_docx(historial, master_df)
     st.download_button(
         "📄 Descargar informe en Word",
         data=informe_docx,
@@ -571,4 +735,4 @@ else:
     )
 
     with st.expander("Ver base de clientes completa (tabla maestra)"):
-        st.dataframe(load_master(sh), use_container_width=True, hide_index=True)
+        st.dataframe(master_df, use_container_width=True, hide_index=True)
