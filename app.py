@@ -45,6 +45,10 @@ HISTORIAL_COLUMNS = [
     "semana", "whatsapp_enviados", "sin_whatsapp", "derivados",
     "ventas_total", "fecha_carga",
 ]
+LOG_CARGAS_COLUMNS = [
+    "fecha_hora", "semana", "nombre_archivo", "filas_en_archivo",
+    "enviados_nuevos", "sin_whatsapp_nuevos", "derivados_nuevos", "ventas_detectadas",
+]
 
 REGIONES_CHILE = {
     "1": "Tarapacá", "2": "Antofagasta", "3": "Atacama", "4": "Coquimbo",
@@ -126,6 +130,32 @@ def guardar_historial(sh, df_hist):
         return
     cuerpo = df_hist[HISTORIAL_COLUMNS].fillna("").astype(str).values.tolist()
     ws.update([HISTORIAL_COLUMNS] + cuerpo)
+
+
+def registrar_carga(sh, semana, nombre_archivo, filas_en_archivo, resultado):
+    """Deja registrada cada carga de Excel (fecha, semana, archivo y qué
+    contó), para poder rastrear qué se subió y cuándo."""
+    ws = _obtener_hoja(sh, "historial_cargas", LOG_CARGAS_COLUMNS)
+    fila = [
+        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        str(semana),
+        nombre_archivo,
+        str(filas_en_archivo),
+        str(resultado["enviados"]),
+        str(resultado["sin_whatsapp"]),
+        str(resultado["derivados"]),
+        str(resultado["ventas_total"]),
+    ]
+    ws.append_row(fila)
+
+
+def load_log_cargas(sh):
+    ws = _obtener_hoja(sh, "historial_cargas", LOG_CARGAS_COLUMNS)
+    registros = ws.get_all_records()
+    if not registros:
+        return pd.DataFrame(columns=LOG_CARGAS_COLUMNS)
+    df = pd.DataFrame(registros)
+    return df.iloc[::-1].reset_index(drop=True)  # más reciente primero (orden de carga real)
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +652,7 @@ with st.sidebar:
                 st.success(f"Archivo leído: {len(df_nuevo)} filas")
                 if st.button("Procesar y agregar al historial", type="primary"):
                     resultado = procesar_semana(sh, df_nuevo, int(semana_num))
+                    registrar_carga(sh, int(semana_num), archivo.name, len(df_nuevo), resultado)
                     st.success(
                         f"Semana {int(semana_num)} procesada:\n\n"
                         f"- WhatsApp enviados (nuevos): {resultado['enviados']}\n"
@@ -733,6 +764,21 @@ else:
         file_name=f"informe_avance_whatsapp_{datetime.now().strftime('%Y%m%d')}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+    with st.expander("📋 Historial de archivos subidos"):
+        log_cargas = load_log_cargas(sh)
+        if log_cargas.empty:
+            st.caption("Todavía no hay cargas registradas.")
+        else:
+            st.dataframe(
+                log_cargas.rename(columns={
+                    "fecha_hora": "Fecha y hora", "semana": "Semana",
+                    "nombre_archivo": "Archivo", "filas_en_archivo": "Filas en el archivo",
+                    "enviados_nuevos": "Enviados (nuevos)", "sin_whatsapp_nuevos": "Sin WhatsApp (nuevos)",
+                    "derivados_nuevos": "Derivados (nuevos)", "ventas_detectadas": "Ventas detectadas ($)",
+                }),
+                use_container_width=True, hide_index=True,
+            )
 
     with st.expander("Ver base de clientes completa (tabla maestra)"):
         st.dataframe(master_df, use_container_width=True, hide_index=True)
